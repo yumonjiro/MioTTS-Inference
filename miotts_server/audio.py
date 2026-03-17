@@ -44,6 +44,29 @@ def write_wav_bytes(audio: torch.Tensor, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def write_pcm_f32_bytes(audio: torch.Tensor) -> bytes:
+    """float32 PCMバイト列を返す（ヘッダなし、ストリーミング用）。"""
+    audio = ensure_1d(audio)
+    if audio.dtype != torch.float32:
+        audio = audio.float()
+    return audio.cpu().numpy().tobytes()
+
+
+def apply_crossfade(prev_tail: torch.Tensor, next_head: torch.Tensor) -> torch.Tensor:
+    """同じ長さの prev_tail と next_head をクロスフェードで合成する。
+
+    equal-power crossfade を使い、音量の谷間を防ぐ。
+    """
+    n = min(len(prev_tail), len(next_head))
+    if n == 0:
+        return prev_tail if len(next_head) == 0 else next_head
+    t = torch.linspace(0.0, 1.0, n, device=prev_tail.device)
+    # equal-power: sin/cos カーブで音量を維持
+    fade_out = torch.cos(t * (torch.pi / 2))
+    fade_in = torch.sin(t * (torch.pi / 2))
+    return prev_tail[:n] * fade_out + next_head[:n] * fade_in
+
+
 def ensure_1d(audio: torch.Tensor) -> torch.Tensor:
     if audio.dim() == 2 and audio.shape[0] == 1:
         return audio.squeeze(0)

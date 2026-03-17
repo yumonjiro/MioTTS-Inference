@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -61,6 +63,34 @@ class LLMClient:
         logger.debug("Sending chat request to %s", self._chat_url)
         return await self._post_with_retry(self._chat_url, payload)
 
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        repetition_penalty: float,
+        presence_penalty: float,
+        frequency_penalty: float,
+    ) -> AsyncIterator[str]:
+        """LLMにストリーミングリクエストを送り、テキストデルタを逐次yieldする。"""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "repeat_penalty": repetition_penalty,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "stream": True,
+        }
+        logger.debug("Sending streaming chat request to %s", self._chat_url)
+        async for delta in self._stream_with_retry(self._chat_url, payload):
+            yield delta
+
     async def _post_with_retry(self, url: str, payload: dict[str, Any]) -> str:
         last_exc: Exception | None = None
         for attempt in range(self._max_retries):
@@ -94,6 +124,71 @@ class LLMClient:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("All retry attempts failed.")
+
+    async def _stream_with_retry(
+        self, url: str, payload: dict[str, Any]
+    ) -> AsyncIterator[str]:
+        """SSEストリーミングレスポンスをパースし、テキストデルタをyieldする。
+
+        リトライはストリーム開始前（接続エラー・リトライ可能ステータス）のみ行う。
+        ストリーム開始後のエラーはそのまま伝播させる。
+        """
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries):
+            try:
+                async with self._client.stream(
+                    "POST", url, json=payload, headers=self._headers
+                ) as response:
+                    if response.status_code in RETRYABLE_STATUS_CODES:
+                        logger.warning(
+                            "Retryable status %d on stream attempt %d/%d",
+                            response.status_code,
+                            attempt + 1,
+                            self._max_retries,
+                        )
+                        # レスポンスボディを消費してからリトライ
+                        await response.aread()
+                        if attempt < self._max_retries - 1:
+                            await asyncio.sleep(self._retry_delay * (2**attempt))
+                            continue
+                        response.raise_for_status()
+                    response.raise_for_status()
+                    # ストリーム開始成功 — SSEイベントをパース
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            return
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            logger.warning("Invalid JSON in SSE data: %s", data_str[:100])
+                            continue
+                        delta = _extract_stream_delta(data)
+                        if delta:
+                            yield delta
+                    return
+            except httpx.TimeoutException as exc:
+                logger.warning(
+                    "Timeout on stream attempt %d/%d: %s", attempt + 1, self._max_retries, exc
+                )
+                last_exc = exc
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(self._retry_delay * (2**attempt))
+            except httpx.ConnectError as exc:
+                logger.warning(
+                    "Connection error on stream attempt %d/%d: %s",
+                    attempt + 1,
+                    self._max_retries,
+                    exc,
+                )
+                last_exc = exc
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(self._retry_delay * (2**attempt))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("All stream retry attempts failed.")
 
     async def resolve_model(self, model: str | None) -> str:
         if model:
@@ -181,3 +276,14 @@ def _flatten_content(content: Any) -> str:
                 parts.append(str(part))
         return "".join(parts)
     return str(content)
+
+
+def _extract_stream_delta(payload: dict[str, Any]) -> str:
+    """OpenAI互換ストリーミングレスポンスからデルタテキストを抽出する。"""
+    choices = payload.get("choices")
+    if not choices:
+        return ""
+    choice = choices[0]
+    delta = choice.get("delta", {})
+    content = delta.get("content", "")
+    return _flatten_content(content) if content else ""

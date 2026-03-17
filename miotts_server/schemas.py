@@ -59,3 +59,28 @@ class TTSResponse(BaseModel):
     token_count: int
     timings: TTSTimings
     normalized_text: str
+
+
+class TTSStreamChunk(BaseModel):
+    """ストリーミングTTSの音声チャンクイベント。"""
+    event: Literal["chunk"] = "chunk"
+    audio: str  # base64エンコードされたraw PCM (float32, mono)
+    chunk_index: int
+    sample_rate: int
+    token_count: int  # このチャンクのトークン数
+
+
+class TTSStreamDone(BaseModel):
+    """ストリーミングTTS完了イベント。"""
+    event: Literal["done"] = "done"
+    total_chunks: int
+    total_token_count: int
+    sample_rate: int
+    timings: TTSTimings
+    normalized_text: str
+
+
+class TTSStreamError(BaseModel):
+    """ストリーミングTTS中のエラーイベント。"""
+    event: Literal["error"] = "error"
+    detail: str

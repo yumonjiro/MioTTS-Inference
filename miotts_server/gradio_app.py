@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 from typing import Any
 
@@ -137,6 +138,126 @@ def _call_tts(
     return (sr, audio), info_text
 
 
+def _call_tts_stream(
+    api_base: str,
+    text: str,
+    reference_mode: str,
+    reference_audio: tuple[int, np.ndarray] | None,
+    preset_id: str,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    presence_penalty: float,
+    frequency_penalty: float,
+    speed: float,
+    max_silence_sec: float,
+):
+    """ストリーミングTTSのジェネレータ。チャンク受信ごとに累積音声とログをyieldする。"""
+    if not text:
+        yield None, "No text provided."
+        return
+    api_base = api_base.rstrip("/")
+
+    payload: dict[str, Any] = {
+        "text": text,
+        "llm": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": 700,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+        },
+        "output": {
+            "speed": speed if speed != 1.0 else None,
+            "max_silence_sec": max_silence_sec if max_silence_sec > 0 else None,
+        },
+    }
+    if reference_mode == "upload" and reference_audio is not None:
+        sr, audio = reference_audio
+        buffer = io.BytesIO()
+        sf.write(buffer, audio, sr, format="WAV")
+        audio_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        payload["reference"] = {"type": "base64", "data": audio_b64}
+    elif preset_id:
+        payload["reference"] = {"type": "preset", "preset_id": preset_id}
+
+    all_chunks: list[np.ndarray] = []
+    sample_rate = 44100
+    log_lines: list[str] = ["Streaming..."]
+    import time
+    t_start = time.perf_counter()
+
+    try:
+        with httpx.stream(
+            "POST", f"{api_base}/v1/tts/stream", json=payload,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        ) as response:
+            if response.status_code != 200:
+                response.read()
+                yield None, f"Error: HTTP {response.status_code}\n{response.text}"
+                return
+
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = data.get("event")
+
+                if event_type == "chunk":
+                    sample_rate = data["sample_rate"]
+                    pcm_bytes = base64.b64decode(data["audio"])
+                    audio_np = np.frombuffer(pcm_bytes, dtype=np.float32)
+                    all_chunks.append(audio_np)
+                    chunk_sec = len(audio_np) / sample_rate
+                    elapsed = time.perf_counter() - t_start
+                    log_lines.append(
+                        f"chunk[{data['chunk_index']}]: "
+                        f"{data['token_count']} tokens, {chunk_sec:.2f}s audio "
+                        f"(elapsed: {elapsed:.2f}s)"
+                    )
+                    # チャンク受信ごとに累積音声をyield
+                    combined = np.concatenate(all_chunks)
+                    yield (sample_rate, combined), "\n".join(log_lines)
+
+                elif event_type == "done":
+                    t_end = time.perf_counter()
+                    timings = data.get("timings", {})
+                    total_tokens = data.get("total_token_count", 0)
+                    total_chunks = data.get("total_chunks", 0)
+                    sample_rate = data.get("sample_rate", sample_rate)
+                    combined = np.concatenate(all_chunks) if all_chunks else np.array([], dtype=np.float32)
+                    total_sec = len(combined) / sample_rate if sample_rate else 0
+                    wall = t_end - t_start
+                    rtf = wall / total_sec if total_sec > 0 else 0
+                    log_lines.append("")
+                    log_lines.append(
+                        f"Done: {total_chunks} chunks, {total_tokens} tokens, "
+                        f"{total_sec:.2f}s audio, {wall:.3f}s wall, RTF={rtf:.3f}"
+                    )
+                    for k, v in timings.items():
+                        if v is not None:
+                            log_lines.append(f"  {k}: {v}s")
+                    yield (sample_rate, combined), "\n".join(log_lines)
+
+                elif event_type == "error":
+                    log_lines.append(f"ERROR: {data.get('detail', 'unknown')}")
+                    combined = np.concatenate(all_chunks) if all_chunks else None
+                    result = (sample_rate, combined) if combined is not None else None
+                    yield result, "\n".join(log_lines)
+                    return
+
+    except httpx.ConnectError:
+        yield None, f"Cannot connect to {api_base}. Is the server running?"
+    except Exception as exc:
+        yield None, f"Error: {exc}"
+
+
 def build_app() -> gr.Blocks:
     presets = _fetch_presets(DEFAULT_API_BASE)
 
@@ -210,6 +331,7 @@ def build_app() -> gr.Blocks:
             )
 
         synth_btn = gr.Button("Synthesize")
+        stream_btn = gr.Button("Synthesize (Stream)", variant="secondary")
         output_audio = gr.Audio(label="Output", type="numpy")
         output_info = gr.Markdown(label="Timings")
 
@@ -237,6 +359,25 @@ def build_app() -> gr.Blocks:
                 best_of_n_enabled,
                 best_of_n_n,
                 best_of_n_language,
+            ],
+            outputs=[output_audio, output_info],
+        )
+
+        stream_btn.click(
+            _call_tts_stream,
+            inputs=[
+                api_base,
+                text,
+                reference_mode,
+                reference_audio,
+                preset_id,
+                temperature,
+                top_p,
+                repetition_penalty,
+                presence_penalty,
+                frequency_penalty,
+                speed,
+                max_silence_sec,
             ],
             outputs=[output_audio, output_info],
         )
