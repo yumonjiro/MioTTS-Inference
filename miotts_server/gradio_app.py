@@ -49,6 +49,7 @@ def _call_tts(
     repetition_penalty: float,
     presence_penalty: float,
     frequency_penalty: float,
+    speed: float,
     best_of_n_enabled: bool,
     best_of_n_n: int,
     best_of_n_language: str,
@@ -66,6 +67,9 @@ def _call_tts(
             "repetition_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
             "frequency_penalty": frequency_penalty,
+        },
+        "output": {
+            "speed": speed if speed != 1.0 else None,
         },
     }
     if reference_mode == "upload" and reference_audio is not None:
@@ -191,6 +195,9 @@ def build_app() -> gr.Blocks:
             frequency_penalty = gr.Slider(0.0, 0.5, value=0.0, step=0.05, label="Frequency Penalty")
 
         with gr.Row():
+            speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
+
+        with gr.Row():
             best_of_n_enabled = gr.Checkbox(value=False, label="Best-of-N")
             best_of_n_n = gr.Slider(1, 8, value=2, step=1, label="N")
             best_of_n_language = gr.Dropdown(
@@ -222,6 +229,7 @@ def build_app() -> gr.Blocks:
                 repetition_penalty,
                 presence_penalty,
                 frequency_penalty,
+                speed,
                 best_of_n_enabled,
                 best_of_n_n,
                 best_of_n_language,

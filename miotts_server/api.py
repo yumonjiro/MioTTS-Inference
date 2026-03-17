@@ -361,7 +361,16 @@ async def _run_tts(
     else:
         tokens = tokens_list[0]
         try:
-            audio = codec_service.synthesize(tokens, reference_waveform, global_embedding)
+            target_audio_length = None
+            speed = (request.output.speed if request.output and request.output.speed else None) or 1.0
+            if speed != 1.0:
+                natural_samples = int(len(tokens) / 25.0 * codec_service.sample_rate)
+                target_audio_length = max(1, int(natural_samples / speed))
+                logger.debug(
+                    "Speed control: speed=%.2f tokens=%d natural_samples=%d target_audio_length=%d",
+                    speed, len(tokens), natural_samples, target_audio_length,
+                )
+            audio = codec_service.synthesize(tokens, reference_waveform, global_embedding, target_audio_length=target_audio_length)
         except Exception as exc:
             logger.exception("Codec synthesis failed")
             raise HTTPException(status_code=500, detail=f"Codec synthesis failed: {exc}") from exc
