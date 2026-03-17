@@ -68,3 +68,57 @@ def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.T
     resampler = torchaudio.transforms.Resample(orig_sr, target_sr)
     resampled = resampler(audio)
     return resampled.squeeze(0)
+
+
+def compress_silence(
+    audio: torch.Tensor,
+    sample_rate: int,
+    max_silence_sec: float = 0.3,
+    silence_threshold: float = 1e-4,
+    frame_sec: float = 0.02,
+) -> torch.Tensor:
+    """無音区間が max_silence_sec を超えないように圧縮する。
+
+    無音判定は frame_sec 単位のフレームエネルギーで行う。
+    max_silence_sec を超える連続無音フレームを max_silence_sec 分に短縮する。
+    有音部分はそのまま保持する。
+    """
+    audio = ensure_1d(audio)
+    if audio.is_cuda:
+        audio = audio.cpu()
+    if audio.dtype not in (torch.float32, torch.float64):
+        audio = audio.float()
+
+    frame_size = max(1, int(sample_rate * frame_sec))
+    max_silent_frames = max(1, int(max_silence_sec / frame_sec))
+    n_frames = audio.numel() // frame_size
+    remainder = audio.numel() % frame_size
+
+    if n_frames == 0:
+        return audio
+
+    frames = audio[: n_frames * frame_size].view(n_frames, frame_size)
+    energy = frames.abs().mean(dim=1)  # shape: (n_frames,)
+    is_silent = energy < silence_threshold
+
+    kept_chunks: list[torch.Tensor] = []
+    silent_run = 0
+
+    for i, silent in enumerate(is_silent.tolist()):
+        frame = frames[i]
+        if silent:
+            silent_run += 1
+            if silent_run <= max_silent_frames:
+                kept_chunks.append(frame)
+            # max_silent_frames を超えたフレームは捨てる
+        else:
+            silent_run = 0
+            kept_chunks.append(frame)
+
+    if remainder > 0:
+        kept_chunks.append(audio[n_frames * frame_size :])
+
+    if not kept_chunks:
+        return audio
+
+    return torch.cat(kept_chunks)

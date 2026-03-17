@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .asr import ASRConfig, ASRService
-from .audio import load_reference_audio_bytes, write_wav_bytes
+from .audio import load_reference_audio_bytes, write_wav_bytes, compress_silence
 from .best_of_n import BestOfNCandidate, detect_language, score_candidates
 from .codec import MioCodecService
 from .config import get_audio_config, get_config, get_llm_defaults
@@ -405,6 +405,16 @@ async def _run_tts(
         rtf,
         len(tokens),
     )
+
+    max_silence_sec = request.output.max_silence_sec if request.output else None
+    if max_silence_sec is not None:
+        before_samples = audio.numel()
+        audio = compress_silence(audio, codec_sample_rate, max_silence_sec=max_silence_sec)
+        logger.debug(
+            "Silence compression: max_silence_sec=%.2f %d→%d samples (%.1f%%)",
+            max_silence_sec, before_samples, audio.numel(),
+            100.0 * (before_samples - audio.numel()) / max(before_samples, 1),
+        )
 
     wav_bytes = write_wav_bytes(audio, codec_sample_rate)
     if output_format == "wav":

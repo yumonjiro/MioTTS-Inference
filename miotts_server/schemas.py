@@ -18,6 +18,7 @@ class LLMParams(BaseModel):
 class OutputConfig(BaseModel):
     format: Literal["wav", "base64"] | None = None
     speed: float | None = Field(default=None, ge=0.5, le=2.0, description="Speech speed factor (1.0 = normal, >1.0 = faster, <1.0 = slower)")
+    max_silence_sec: float | None = Field(default=None, ge=0.05, le=2.0, description="Compress silent regions longer than this value (seconds). None = no compression.")
 
 
 class ReferenceConfig(BaseModel):

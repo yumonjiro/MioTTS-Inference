@@ -50,6 +50,7 @@ def _call_tts(
     presence_penalty: float,
     frequency_penalty: float,
     speed: float,
+    max_silence_sec: float,
     best_of_n_enabled: bool,
     best_of_n_n: int,
     best_of_n_language: str,
@@ -70,6 +71,7 @@ def _call_tts(
         },
         "output": {
             "speed": speed if speed != 1.0 else None,
+            "max_silence_sec": max_silence_sec if max_silence_sec > 0 else None,
         },
     }
     if reference_mode == "upload" and reference_audio is not None:
@@ -196,6 +198,7 @@ def build_app() -> gr.Blocks:
 
         with gr.Row():
             speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
+            max_silence_sec = gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Max Silence (sec, 0=off)")
 
         with gr.Row():
             best_of_n_enabled = gr.Checkbox(value=False, label="Best-of-N")
@@ -230,6 +233,7 @@ def build_app() -> gr.Blocks:
                 presence_penalty,
                 frequency_penalty,
                 speed,
+                max_silence_sec,
                 best_of_n_enabled,
                 best_of_n_n,
                 best_of_n_language,
