@@ -29,7 +29,7 @@ from .schemas import (
     TTSResponse,
     TTSTimings,
 )
-from .text import normalize_text
+from .text import normalize_text, is_symbol_only
 from .token_parser import parse_speech_tokens
 
 logger = logging.getLogger(__name__)
@@ -180,6 +180,28 @@ async def _run_tts(
         normalized = normalize_text(request.text)
     else:
         normalized = request.text.strip()
+
+    # 記号のみのテキストは無音WAVを返す（LLM/codec をスキップ）
+    if is_symbol_only(normalized):
+        codec_service_: MioCodecService = app.state.codec_service
+        sr = codec_service_.sample_rate
+        silent_audio = torch.zeros(sr // 10, dtype=torch.float32)  # 0.1秒の無音
+        wav_bytes = write_wav_bytes(silent_audio, sr)
+        if output_format == "wav":
+            return StreamingResponse(
+                io.BytesIO(wav_bytes),
+                media_type="audio/wav",
+                headers={"Content-Disposition": "attachment; filename=tts.wav"},
+            )
+        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        return JSONResponse(content=TTSResponse(
+            audio=audio_b64,
+            format="base64",
+            sample_rate=sr,
+            token_count=0,
+            timings=TTSTimings(llm_sec=0, parse_sec=0, codec_sec=0, total_sec=0),
+            normalized_text=normalized,
+        ).model_dump())
 
     llm_params = request.llm or LLMParams()
     model = llm_params.model or config.llm_model

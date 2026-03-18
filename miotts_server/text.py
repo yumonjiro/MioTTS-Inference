@@ -65,3 +65,12 @@ def normalize_text(text: str) -> str:
         text = text.rstrip("。、")
 
     return text
+
+
+# 文字/数字を含まず記号・空白のみで構成されるテキストを検出する
+_RE_HAS_WORD_CHAR = re.compile(r"[\w]", re.UNICODE)
+
+
+def is_symbol_only(text: str) -> bool:
+    """Return True if text contains no word characters (letters/digits/underscore)."""
+    return not _RE_HAS_WORD_CHAR.search(text)
