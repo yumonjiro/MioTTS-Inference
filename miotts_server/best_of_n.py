@@ -363,6 +363,43 @@ def _edit_distance(seq_a: list, seq_b: list) -> int:
     return dp[-1]
 
 
+def max_allowed_tokens(text: str, language: str, threshold: float = 2.0) -> int:
+    """入力テキストの音素数から、許容される最大スピーチトークン数を算出する。
+
+    計算: phonemes × max_spp × threshold × TOKEN_RATE_HZ + bonus
+    threshold は max_expected_sec に対する倍率。
+    """
+    lang = language if language in {"ja", "en"} else detect_language(text)
+    phonemes = max(_phoneme_count(text, lang), 1)
+    _, max_spp = _SPP_MINMAX.get(lang, _SPP_MINMAX["other"])
+    bonus = _punctuation_bonus_sec(text)
+    max_expected_sec = phonemes * max_spp + bonus
+    return int(max_expected_sec * threshold * _TOKEN_RATE_HZ)
+
+
+def max_expected_duration(text: str, language: str, threshold: float = 2.0) -> float:
+    """入力テキストの音素数から、許容される最大音声秒数を算出する。"""
+    lang = language if language in {"ja", "en"} else detect_language(text)
+    phonemes = max(_phoneme_count(text, lang), 1)
+    _, max_spp = _SPP_MINMAX.get(lang, _SPP_MINMAX["other"])
+    bonus = _punctuation_bonus_sec(text)
+    return (phonemes * max_spp + bonus) * threshold
+
+
+def is_token_hallucination(
+    tokens: list[int], text: str, language: str, threshold: float = 2.0,
+) -> bool:
+    """LLM生成のスピーチトークン数が音素数ベースの動的閾値を超えていれば True。"""
+    return len(tokens) > max_allowed_tokens(text, language, threshold)
+
+
+def is_audio_hallucination(
+    audio_sec: float, text: str, language: str, threshold: float = 2.0,
+) -> bool:
+    """デコード後の音声秒数が音素数ベースの動的閾値を超えていれば True。"""
+    return audio_sec > max_expected_duration(text, language, threshold)
+
+
 async def _run_asr(
     asr_service: ASRService,
     candidates: list[BestOfNCandidate],

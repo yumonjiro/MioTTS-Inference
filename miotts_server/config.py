@@ -56,6 +56,10 @@ class ServerConfig:
     asr_compute_type: str
     asr_batch_size: int
     asr_language: str
+    # ハルシネーション検出リトライ
+    hallucination_max_retries: int
+    hallucination_token_threshold: float   # LLMトークン数の閾値倍率
+    hallucination_audio_threshold: float   # デコード後音声秒数の閾値倍率
 
 
 @dataclass
@@ -113,6 +117,9 @@ def get_config() -> ServerConfig:
             asr_compute_type=os.getenv("MIOTTS_ASR_COMPUTE_TYPE", default_asr_compute_type),
             asr_batch_size=_env_int("MIOTTS_ASR_BATCH_SIZE", 0),
             asr_language=os.getenv("MIOTTS_ASR_LANGUAGE", "auto"),
+            hallucination_max_retries=_env_int("MIOTTS_HALLUCINATION_MAX_RETRIES", 2),
+            hallucination_token_threshold=_env_float("MIOTTS_HALLUCINATION_TOKEN_THRESHOLD", 1.1),
+            hallucination_audio_threshold=_env_float("MIOTTS_HALLUCINATION_AUDIO_THRESHOLD", 1.1),
         )
     return _config
 

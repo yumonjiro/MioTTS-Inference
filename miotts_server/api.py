@@ -15,8 +15,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .asr import ASRConfig, ASRService
-from .audio import load_reference_audio_bytes, write_wav_bytes, compress_silence
-from .best_of_n import BestOfNCandidate, detect_language, score_candidates
+from .audio import load_reference_audio_bytes, write_wav_bytes, compress_silence, trim_silence, time_stretch
+from .best_of_n import (
+    BestOfNCandidate,
+    detect_language,
+    is_audio_hallucination,
+    is_token_hallucination,
+    max_allowed_tokens,
+    max_expected_duration,
+    score_candidates,
+)
 from .codec import MioCodecService
 from .config import get_audio_config, get_config, get_llm_defaults
 from .llm_client import LLMClient
@@ -247,35 +255,86 @@ async def _run_tts(
                 status_code=500, detail=f"Failed to resolve LLM model: {exc}"
             ) from exc
 
-    t0 = time.perf_counter()
-    try:
-        llm_texts = await _fetch_llm_candidates(
-            llm_client=llm_client,
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            n=best_of_n.n if best_of_n.enabled else 1,
+    # ── max_tokens を音素数ベースで動的に制限 ─────────────────────────────
+    # 入力テキストから許容トークン上限を算出し、ユーザ指定/デフォルトの
+    # max_tokens と比較して小さい方を採用する。
+    # これにより短い文で LLM が暴走的に長いトークン列を生成するのを防ぐ。
+    hal_token_threshold = config.hallucination_token_threshold
+    dynamic_limit = max_allowed_tokens(normalized, detected_language, hal_token_threshold)
+    effective_max_tokens = min(max_tokens, dynamic_limit)
+    if effective_max_tokens < max_tokens:
+        logger.debug(
+            "Dynamic max_tokens: %d → %d (phoneme-based limit for '%s')",
+            max_tokens, effective_max_tokens, normalized[:40],
         )
-    except Exception as exc:
-        logger.exception("LLM request failed")
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+
+    # ── ハルシネーション検出付き LLM リトライループ ──────────────────────
+    # LLM出力のスピーチトークン数が、入力テキストの音素数から動的に算出した
+    # 閾値を超えたら再生成する。best-of-n 有効時はスコアリングに任せる。
+    hal_max_retries = config.hallucination_max_retries
+    tokens_list: list[list[int]] = []
+    hal_attempt = 0
+
+    t0 = time.perf_counter()
+    for hal_attempt in range(hal_max_retries + 1):
+        try:
+            llm_texts = await _fetch_llm_candidates(
+                llm_client=llm_client,
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=effective_max_tokens,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                n=best_of_n.n if best_of_n.enabled else 1,
+            )
+        except Exception as exc:
+            logger.exception("LLM request failed")
+            raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+
+        tokens_list = []
+        for llm_text in llm_texts:
+            try:
+                tokens_list.append(parse_speech_tokens(llm_text))
+            except ValueError as exc:
+                logger.warning("Skipping candidate with invalid tokens: %s", exc)
+        if not tokens_list:
+            raise HTTPException(status_code=422, detail="No speech tokens found in LLM output.")
+
+        # best-of-n 有効時はスコアリングに任せてリトライしない
+        if best_of_n.enabled and best_of_n.n > 1:
+            break
+
+        candidate_tokens = tokens_list[0]
+        if not is_token_hallucination(
+            candidate_tokens, normalized, detected_language, hal_token_threshold,
+        ):
+            break  # 正常範囲
+
+        limit = max_allowed_tokens(normalized, detected_language, hal_token_threshold)
+        logger.warning(
+            "Token hallucination detected (attempt %d/%d): "
+            "speech_tokens=%d limit=%d (%.1fs vs %.1fs max) text='%s'",
+            hal_attempt + 1,
+            hal_max_retries + 1,
+            len(candidate_tokens),
+            limit,
+            len(candidate_tokens) / 25.0,
+            limit / 25.0,
+            normalized[:60],
+        )
+        if hal_attempt >= hal_max_retries:
+            logger.warning("Max token-hallucination retries reached, proceeding")
+
     t1 = time.perf_counter()
 
-    tokens_list: list[list[int]] = []
-    for llm_text in llm_texts:
-        try:
-            tokens_list.append(parse_speech_tokens(llm_text))
-        except ValueError as exc:
-            logger.warning("Skipping candidate with invalid tokens: %s", exc)
-    if not tokens_list:
-        raise HTTPException(status_code=422, detail="No speech tokens found in LLM output.")
     logger.debug(
-        "LLM candidates: count=%d token_lengths=%s", len(tokens_list), [len(t) for t in tokens_list]
+        "LLM candidates: count=%d token_lengths=%s attempts=%d",
+        len(tokens_list),
+        [len(t) for t in tokens_list],
+        hal_attempt + 1,
     )
     t2 = time.perf_counter()
 
@@ -381,21 +440,72 @@ async def _run_tts(
         audio = selected.audio
         logger.debug("Best-of-n selected index=%d tokens=%d", best_idx, len(tokens))
     else:
-        tokens = tokens_list[0]
-        try:
-            target_audio_length = None
-            speed = (request.output.speed if request.output and request.output.speed else None) or 1.0
-            if speed != 1.0:
-                natural_samples = int(len(tokens) / 25.0 * codec_service.sample_rate)
-                target_audio_length = max(1, int(natural_samples / speed))
-                logger.debug(
-                    "Speed control: speed=%.2f tokens=%d natural_samples=%d target_audio_length=%d",
-                    speed, len(tokens), natural_samples, target_audio_length,
+        # ── デコード後の音声秒数ハルシネーション検出付きリトライ ──
+        # codec デコード後の実際の音声長が期待値を大幅に超えた場合、
+        # LLM→codec を再試行する
+        hal_audio_threshold = config.hallucination_audio_threshold
+
+        for audio_attempt in range(hal_max_retries + 1):
+            tokens = tokens_list[0]
+            try:
+                audio = codec_service.synthesize(tokens, reference_waveform, global_embedding)
+            except Exception as exc:
+                logger.exception("Codec synthesis failed")
+                raise HTTPException(status_code=500, detail=f"Codec synthesis failed: {exc}") from exc
+
+            # デコード後の音声秒数チェック
+            decoded_sec = float(audio.numel()) / float(codec_service.sample_rate)
+            if not is_audio_hallucination(
+                decoded_sec, normalized, detected_language, hal_audio_threshold,
+            ):
+                break  # 正常
+
+            max_dur = max_expected_duration(
+                normalized, detected_language, hal_audio_threshold,
+            )
+            logger.warning(
+                "Audio hallucination detected (attempt %d/%d): "
+                "audio=%.1fs limit=%.1fs tokens=%d text='%s'",
+                audio_attempt + 1,
+                hal_max_retries + 1,
+                decoded_sec,
+                max_dur,
+                len(tokens),
+                normalized[:60],
+            )
+            if audio_attempt >= hal_max_retries:
+                logger.warning(
+                    "Max audio-hallucination retries reached, proceeding"
                 )
-            audio = codec_service.synthesize(tokens, reference_waveform, global_embedding, target_audio_length=target_audio_length)
-        except Exception as exc:
-            logger.exception("Codec synthesis failed")
-            raise HTTPException(status_code=500, detail=f"Codec synthesis failed: {exc}") from exc
+                break
+
+            # LLM から再生成してリトライ
+            try:
+                llm_texts = await _fetch_llm_candidates(
+                    llm_client=llm_client,
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=effective_max_tokens,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    n=1,
+                )
+            except Exception as exc:
+                logger.exception("LLM retry request failed")
+                break
+            tokens_list = []
+            for llm_text in llm_texts:
+                try:
+                    tokens_list.append(parse_speech_tokens(llm_text))
+                except ValueError:
+                    pass
+            if not tokens_list:
+                logger.warning("No valid tokens on audio-hallucination retry")
+                break
+
         t3 = time.perf_counter()
 
     codec_sample_rate = codec_service.sample_rate
@@ -436,6 +546,25 @@ async def _run_tts(
             "Silence compression: max_silence_sec=%.2f %d→%d samples (%.1f%%)",
             max_silence_sec, before_samples, audio.numel(),
             100.0 * (before_samples - audio.numel()) / max(before_samples, 1),
+        )
+
+    # 前後の無音をトリム
+    before_trim = audio.numel()
+    audio = trim_silence(audio, codec_sample_rate)
+    if before_trim != audio.numel():
+        logger.debug(
+            "Trim silence: %d→%d samples",
+            before_trim, audio.numel(),
+        )
+
+    # ポストプロセスで話速制御 (WSOLA)
+    speed = (request.output.speed if request.output and request.output.speed else None) or 1.0
+    if abs(speed - 1.0) > 1e-6:
+        before_stretch = audio.numel()
+        audio = time_stretch(audio, speed, codec_sample_rate)
+        logger.debug(
+            "Time stretch: speed=%.2f %d→%d samples",
+            speed, before_stretch, audio.numel(),
         )
 
     wav_bytes = write_wav_bytes(audio, codec_sample_rate)

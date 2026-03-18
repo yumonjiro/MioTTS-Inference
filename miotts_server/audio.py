@@ -122,3 +122,63 @@ def compress_silence(
         return audio
 
     return torch.cat(kept_chunks)
+
+
+def trim_silence(
+    audio: torch.Tensor,
+    sample_rate: int,
+    silence_threshold: float = 1e-4,
+    frame_sec: float = 0.02,
+) -> torch.Tensor:
+    """音声の先頭と末尾の無音区間を除去する。"""
+    audio = ensure_1d(audio)
+    if audio.is_cuda:
+        audio = audio.cpu()
+    if audio.dtype not in (torch.float32, torch.float64):
+        audio = audio.float()
+
+    frame_size = max(1, int(sample_rate * frame_sec))
+    n_frames = audio.numel() // frame_size
+    if n_frames == 0:
+        return audio
+
+    frames = audio[: n_frames * frame_size].view(n_frames, frame_size)
+    energy = frames.abs().mean(dim=1)
+    voiced = (energy >= silence_threshold).nonzero(as_tuple=True)[0]
+    if voiced.numel() == 0:
+        return audio[:0]  # 全区間無音
+
+    first = int(voiced[0].item()) * frame_size
+    last_frame = int(voiced[-1].item())
+    # 最後の有音フレームの終端 (余り部分も含める)
+    last = min((last_frame + 1) * frame_size, audio.numel())
+    return audio[first:last]
+
+
+def time_stretch(
+    audio: torch.Tensor,
+    rate: float,
+    sample_rate: int,
+) -> torch.Tensor:
+    """torchaudio.functional.speed で音声をタイムストレッチする (ピッチ変化なし)。
+
+    rate > 1.0 → 速く (短く)、rate < 1.0 → 遅く (長く)。
+    """
+    if abs(rate - 1.0) < 1e-6:
+        return audio
+
+    import torchaudio
+
+    audio = ensure_1d(audio)
+    if audio.is_cuda:
+        audio = audio.cpu()
+    if audio.dtype not in (torch.float32, torch.float64):
+        audio = audio.float()
+
+    if audio.numel() == 0:
+        return audio
+
+    # torchaudio.functional.speed は (channels, samples) を期待する
+    waveform = audio.unsqueeze(0)
+    stretched, _ = torchaudio.functional.speed(waveform, sample_rate, rate)
+    return stretched.squeeze(0)
